@@ -1,0 +1,441 @@
+---
+title: "Predicting Wildfire Incidence in the United States"
+subtitle: "STA 141A Final Project — Winter Quarter 2026"
+author: "STA 141A Student"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+---
+
+# Abstract
+
+This report develops a binary classification pipeline to predict whether a notable wildfire (final burned area >= 300 acres) will occur in a given U.S. state during a given month, using historical wildfire records from the 1992-2015 FPA-FOD dataset. After filtering to notable fires and aggregating records into state by month units, we construct a binary outcome variable and three predictors: calendar month, year, and state. Exploratory analysis reveals strong seasonality (wildfire occurrence peaks in April) and pronounced geographic concentration in western states. Two models are compared: a logistic regression baseline (AUC = 0.784) and a random forest (AUC = 0.850). Split-sample validation with training on 1992-2009 data and testing on 2010-2015 data is used throughout to prevent data leakage. The random forest outperforms the baseline, with state and month identified as the most important predictors.
+
+---
+
+# Data Preprocessing
+
+## Data Source and Loading
+
+The wildfire records are drawn from the publicly available **FPA-FOD (Fire Program Analysis Fire-Occurrence Database)** dataset, distributed as a SQLite database (`FPA_FOD_20170508.sqlite`). The database contains approximately 1.88 million wildfire records across the contiguous United States from 1992 to 2015, including ignition location (latitude, longitude, state), discovery date, and final fire size in acres.
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+library(DBI)
+library(RSQLite)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+
+con <- dbConnect(SQLite(), "/Users/harryguan/Downloads/FPA_FOD_20170508.sqlite")
+
+fires_raw <- dbReadTable(con, "Fires")
+dbDisconnect(con)
+
+cat("Raw dataset dimensions:", nrow(fires_raw), "rows x", ncol(fires_raw), "columns\n")
+```
+
+## Defining Notable Fires
+
+The vast majority of recorded wildfires are very small and rapidly contained. Including all fires would create extreme class imbalance and mess up the dynamics of operationally and scientifically significant events. To get around this, we define a notable fire as one with a final burned area of >= 300 acres. This threshold is consistent with the recommendation in the project description. Fires below this size are typically contained quickly and have limited ecological or operational impact.
+
+```{r}
+fires <- fires_raw %>%
+  as_tibble() %>%
+  filter(FIRE_SIZE >= 300) %>%
+  filter(!is.na(STATE), !is.na(DISCOVERY_DOY), !is.na(FIRE_YEAR)) %>%
+  mutate(
+    FIRE_YEAR  = as.integer(FIRE_YEAR),
+    FIRE_MONTH = as.integer(
+      format(as.Date(DISCOVERY_DOY - 1, origin = paste0(FIRE_YEAR, "-01-01")), "%m")
+      ),
+    STATE = as.character(STATE)
+  )
+
+cat("Notable fires (>= 300 acres):", nrow(fires), "\n")
+cat("Years covered:", min(fires$FIRE_YEAR), "to", max(fires$FIRE_YEAR), "\n")
+cat("Unique states:", n_distinct(fires$STATE), "\n")
+```
+
+## Constructing Space-Time Units
+
+I used U.S. state x calendar month as the space-time unit. If we used finer units like counties or grid cells, it would produce many all-zero cells and make the prediction problem ill-conditioned, while coarser units like state x year would discard the strong seasonal signal visible in the data.
+
+```{r}
+all_states <- sort(unique(fires$STATE))
+all_years  <- sort(unique(fires$FIRE_YEAR))
+
+grid <- expand.grid(
+  STATE      = all_states,
+  FIRE_YEAR  = all_years,
+  FIRE_MONTH = 1:12,
+  stringsAsFactors = FALSE
+) %>% as_tibble()
+
+fire_counts <- fires %>%
+  group_by(STATE, FIRE_YEAR, FIRE_MONTH) %>%
+  summarise(
+    n_fires     = n(),
+    total_acres = sum(FIRE_SIZE, na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+modeling_df <- grid %>%
+  left_join(fire_counts, by = c("STATE", "FIRE_YEAR", "FIRE_MONTH")) %>%
+  mutate(
+    n_fires     = replace_na(n_fires, 0),
+    total_acres = replace_na(total_acres, 0),
+    fire        = as.integer(n_fires > 0)   # binary outcome
+  )
+
+cat("Modeling dataset dimensions:", nrow(modeling_df), "rows x",
+    ncol(modeling_df), "columns\n")
+cat("Overall fire rate (proportion of state-months with >= 1 notable fire):",
+    round(mean(modeling_df$fire), 3), "\n")
+```
+
+## Predictor Construction
+
+We construct the following predictors from the space-time structure of the data. No external data sources are required.
+
+`FIRE_MONTH`  Calendar month (1-12); captures raw seasonality 
+`FIRE_YEAR`   Calendar year; captures long-term trend 
+`STATE_f`     State as a factor; captures geographic heterogeneity 
+
+```{r}
+modeling_df <- modeling_df %>%
+  mutate(
+    FIRE_MONTH = as.integer(FIRE_MONTH),
+    STATE_f    = factor(STATE)
+  )
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Seasonal Patterns
+
+One of the most important signals in wildfire data is seasonality. We expect fires to peak in the dry summer months. The plot below shows the fraction of state-months experiencing at least one notable fire for each calendar month, averaged across all years and states.
+
+```{r fig.cap="Figure 1. Seasonal pattern of notable wildfire occurrence (1992-2015). Each bar shows the fraction of state and month combinations with at least one notable fire in that calendar month. Wildfire incidence peaks strongly in April with a secondary peak in July, motivating the inclusion of month as a key predictor."}
+seasonal <- modeling_df %>%
+  group_by(FIRE_MONTH) %>%
+  summarise(fire_rate = mean(fire), .groups = "drop")
+
+ggplot(seasonal, aes(x = factor(FIRE_MONTH, labels = month.abb), y = fire_rate)) +
+  geom_col(fill = "#E25822", alpha = 0.85) +
+  labs(
+    title   = "Seasonal Pattern of Notable Wildfire Incidence (1992-2015)",
+    x       = "Month",
+    y       = "Fraction of state/month combinations with >= 1 notable fire",
+    caption = "Source: FPA-FOD dataset, fires >= 300 acres"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+**Interpretation:** Fire occurrence is highly seasonal, peaking in April with a secondary peak in July. Activity is lowest in December and January. This strong seasonal pattern justifies the inclusion of FIRE_MONTH as a predictor.
+
+## Geographic Distribution
+
+Wildfire risk is not uniformly distributed across the United States. Western states with dry climates and large forested areas experience far more notable fires than eastern states.
+
+```{r, fig.cap="Figure 2. Total notable wildfires by state (top 20 states, 1992-2015). Western states, particularly California, Idaho, Montana, and Colorado, account for the majority of notable fires, strongly motivating the inclusion of STATE as a predictor in both models."}
+state_totals <- fires %>%
+  count(STATE, name = "total_fires") %>%
+  arrange(desc(total_fires))
+
+ggplot(state_totals %>% slice_max(total_fires, n = 20),
+       aes(x = reorder(STATE, total_fires), y = total_fires)) +
+  geom_col(fill = "#8B1A1A", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title   = "Top 20 States by Total Notable Wildfires (1992-2015)",
+    x       = "State",
+    y       = "Total notable fires (>= 300 acres)",
+    caption = "Source: FPA-FOD dataset"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+**Interpretation:** The top states for notable fires are overwhelmingly in the West (CA, ID, MT, CO, NV, AZ, WA). This geographic concentration justifies including `STATE_f` as a predictor. Both models will learn that western states have structurally higher baseline fire probabilities.
+
+## Temporal Trend
+
+```{r fig.cap="Figure 3. Annual count of notable wildfires in the U.S. (1992-2015). The trend line shows a gradual increase over time, though year-to-year variation is large, with notable spikes in 2000 and 2006."}
+annual <- fires %>%
+  count(FIRE_YEAR, name = "n_fires")
+
+ggplot(annual, aes(x = FIRE_YEAR, y = n_fires)) +
+  geom_line(linewidth = 1, color = "#E25822") +
+  geom_point(size = 2, color = "#8B1A1A") +
+  geom_smooth(method = "lm", se = TRUE, linetype = 2, color = "gray40") +
+  labs(
+    title   = "Annual Count of Notable Wildfires in the U.S. (1992-2015)",
+    x       = "Year",
+    y       = "Number of notable fires (>= 300 acres)",
+    caption = "Source: FPA-FOD dataset"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+**Interpretation:** Annual notable fire counts vary considerably from year to year, with large spikes in 2000 and 2006. Despite this volatility, the overall trend is upward across the period. Including FIRE_YEAR as a predictor allows both models to capture this gradual increase in fire risk over time.
+
+## Dataset Summary Table
+
+```{r}
+summary_tbl <- tibble(
+  Item  = c(
+    "Spatial unit", "Temporal unit", "Years covered",
+    "Number of states", "Total space-time cells",
+    "Cells with >= 1 notable fire", "Overall fire rate",
+    "Notable fire cutoff", "Predictors"
+  ),
+  Value = c(
+    "U.S. state", "Calendar month", "1992-2015",
+    as.character(n_distinct(modeling_df$STATE)),
+    as.character(nrow(modeling_df)),
+    as.character(sum(modeling_df$fire)),
+    paste0(round(100 * mean(modeling_df$fire), 1), "%"),
+    ">= 300 acres",
+    "FIRE_MONTH, FIRE_YEAR, STATE_f"
+  )
+)
+
+knitr::kable(summary_tbl, caption = "Table 1. Summary of the modeling dataset.")
+```
+
+---
+
+# Modeling
+
+## Prediction Task
+
+For each combination of state and month, we predict a binary outcome: whether at least one notable fire occurred during that period.
+
+## Baseline Model: Logistic Regression
+
+The baseline model is logistic regression, the natural starting point for binary classification problems. We model the probability of a notable fire occurring as a function of our predictors using glm(..., family = binomial), as demonstrated in the prediction labs in the class.
+
+The model takes the form: log(p / (1 - p)) = β₀ + β₁·FIRE_MONTH + β₂·FIRE_YEAR + β₃·STATE, where p is the predicted probability of a notable fire.
+
+**Motivation:** Logistic regression is interpretable, well-understood, and provides calibrated probability estimates. It serves as the performance benchmark against which the second model is compared.
+
+## Second Model: Random Forest
+
+The second model is a random forest, a bunch of decision trees. Each tree is trained on a bootstrap sample of the training data with a random subset of features considered at each split, and the final predicted probability is averaged across all 500 trees.
+
+**Model schematic:**
+
+```
+Input: FIRE_ MONTH, FIRE_YEAR, STATE_f
+          |
+          v
+  B = 500 decision trees
+  (each on bootstrap sample, random mtry = 2 features per split)
+          |
+          v
+  Average predicted probability --> P(fire = 1)
+```
+
+**Motivation over logistic regression:**
+
+- Captures non-linear interaction. e.g., the joint effect of summer season AND western state location without requiring manual feature engineering.
+- Provides variable importance to confirm which predictors matter most, consistent with EDA.
+- Reduces overfitting by averaging many diverse trees (course notes: "many weak models together form a strong predictor").
+
+---
+
+# Model Fitting and Validation
+
+## Time-Aware
+
+To prevent data leakage, we apply a strict temporal split: models are trained on 1992-2009 data and evaluated on 2010-2015 data. This ensures no future information is used to predict the past, respecting the temporal structure of the data.
+
+```{r}
+train <- modeling_df %>% filter(FIRE_YEAR <= 2009)
+test  <- modeling_df %>% filter(FIRE_YEAR >= 2010)
+
+cat("Training set:", nrow(train), "observations |",
+    sum(train$fire), "fire events\n")
+cat("Test set:    ", nrow(test),  "observations |",
+    sum(test$fire),  "fire events\n")
+cat("Training years: 1992-2009 | Test years: 2010-2015\n")
+```
+
+## Baseline: Logistic Regression
+
+```{r}
+log_fit <- glm(
+  fire ~ FIRE_MONTH + FIRE_YEAR + STATE_f,
+  data   = train,
+  family = binomial
+)
+
+test <- test %>%
+  mutate(p_hat_logistic = predict(log_fit, newdata = test, type = "response"))
+
+roc_log <- roc(response = test$fire, predictor = test$p_hat_logistic,
+               quiet = TRUE)
+auc_log <- as.numeric(auc(roc_log))
+cat("Logistic regression test AUC:", round(auc_log, 4), "\n")
+```
+
+## Second Model: Random Forest
+
+```{r}
+set.seed(141)
+
+train_rf <- train %>% mutate(fire_f = factor(fire, levels = c(0, 1)))
+test_rf  <- test  %>% mutate(fire_f = factor(fire, levels = c(0, 1)))
+
+rf_fit <- randomForest(
+  fire_f ~ FIRE_MONTH + FIRE_YEAR + STATE_f,
+  data       = train_rf,
+  ntree      = 500,
+  mtry       = 2,
+  importance = TRUE
+)
+
+rf_prob <- predict(rf_fit, newdata = test_rf, type = "prob")[, "1"]
+test <- test %>% mutate(p_hat_rf = rf_prob)
+
+roc_rf <- roc(response = test$fire, predictor = test$p_hat_rf, quiet = TRUE)
+auc_rf <- as.numeric(auc(roc_rf))
+cat("Random forest test AUC:", round(auc_rf, 4), "\n")
+```
+
+## Diagnostic Plot 1: OOB Error vs. Number of Trees
+
+We verify that the random forest has converged by plotting the out-of-bag (OOB) error as a function of the number of trees.
+
+```{r fig.cap="Figure 4. OOB error rates for the random forest stabilize after around 100 trees, confirming 500 trees is sufficient. The model predicts non-fire months (Class 0) much more accurately than fire months (Class 1), reflecting the class imbalance in the data."}
+oob_df <- data.frame(
+  trees  = seq_len(nrow(rf_fit$err.rate)),
+  OOB    = rf_fit$err.rate[, "OOB"],
+  class0 = rf_fit$err.rate[, "0"],
+  class1 = rf_fit$err.rate[, "1"]
+)
+
+ggplot(oob_df, aes(x = trees)) +
+  geom_line(aes(y = OOB,    color = "OOB overall"),      linewidth = 0.8) +
+  geom_line(aes(y = class0, color = "Class 0 (no fire)"), linewidth = 0.8) +
+  geom_line(aes(y = class1, color = "Class 1 (fire)"),    linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "OOB overall"      = "black",
+    "Class 0 (no fire)"= "steelblue",
+    "Class 1 (fire)"   = "#E25822"
+  )) +
+  labs(
+    title = "Random Forest: OOB Error vs. Number of Trees",
+    x     = "Number of trees",
+    y     = "OOB error rate",
+    color = ""
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+## Diagnostic Plot 2: Variable Importance
+
+```{r fig.cap="Figure 5. Variable importance plot for the random forest. STATE_f is by far the most important predictor, followed by FIRE_MONTH. FIRE_YEAR contributes relatively little, confirming that geography and seasonality are the dominant drivers of wildfire occurrence."}
+imp_df <- importance(rf_fit) %>%
+  as.data.frame() %>%
+  rownames_to_column("variable") %>%
+  arrange(desc(MeanDecreaseAccuracy))
+
+ggplot(imp_df,
+       aes(x = reorder(variable, MeanDecreaseAccuracy),
+           y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "#8B1A1A", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title = "Random Forest: Variable Importance (Mean Decrease in Accuracy)",
+    x     = "Predictor",
+    y     = "Mean decrease in accuracy"
+  ) +
+  theme_bw(base_size = 13)
+```
+
+## Diagnostic Plot 3: ROC Curve Comparison
+
+We overlay the ROC curves for both models on the 2010-2015 test set.
+
+```{r diag-roc, fig.cap="ROC curves for logistic regression (AUC = 0.784) and random forest (AUC = 0.852) on the 2010-2015 test set. The random forest substantially outperforms the logistic baseline across the full range of classification thresholds."}
+roc_log_df <- tibble(
+  fpr   = 1 - roc_log$specificities,
+  tpr   = roc_log$sensitivities,
+  model = paste0("Logistic Regression (AUC = ", round(auc_log, 3), ")")
+)
+roc_rf_df <- tibble(
+  fpr   = 1 - roc_rf$specificities,
+  tpr   = roc_rf$sensitivities,
+  model = paste0("Random Forest (AUC = ", round(auc_rf, 3), ")")
+)
+
+bind_rows(roc_log_df, roc_rf_df) %>%
+  ggplot(aes(x = fpr, y = tpr, color = model, linetype = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("steelblue", "#E25822")) +
+  coord_equal() +
+  labs(
+    title    = "ROC Curve Comparison (Test Set 2010-2015)",
+    x        = "False positive rate (1 - Specificity)",
+    y        = "True positive rate (Sensitivity)",
+    color    = "",
+    linetype = ""
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+## Performance Summary Table
+
+```{r perf-table}
+perf_tbl <- tibble(
+  Model          = c("Logistic Regression (baseline)", "Random Forest"),
+  `Train period` = c("1992-2009", "1992-2009"),
+  `Test period`  = c("2010-2015", "2010-2015"),
+  `Test AUC`     = c(round(auc_log, 4), round(auc_rf, 4))
+)
+
+knitr::kable(
+  perf_tbl,
+  caption = "Table 2. Test-set AUC for both models. A strict temporal split
+             (train: 1992-2009; test: 2010-2015) prevents data leakage."
+)
+```
+
+---
+
+# Summary
+
+## Key EDA Findings
+The exploratory analysis revealed three dominant patterns in U.S. wildfire occurrence across the 1992-2015 period. First, wildfire occurrence is strongly seasonal, peaking in April with a secondary peak in July and dropping to its lowest in December and January. Second, notable wildfires are geographically concentrated in western states, with California, Idaho, Montana, Colorado, Nevada, and Arizona accounting for the large majority of fires above the 300-acre threshold. Third, annual fire counts show a modest upward trend over the period despite large year-to-year swings, with notable spikes in 2000 and 2006. These three patterns directly motivated our choice of predictors: FIRE_MONTH for seasonality, STATE_f for geography, and FIRE_YEAR for the long-term trend.
+
+## Model Performance
+Both models were trained on 1992-2009 data and evaluated on 2010-2015 data to prevent data leakage. The logistic regression baseline achieved a test AUC of 0.784, while the random forest achieved 0.850, a meaningful improvement. The variable importance plot confirms that STATE_f is by far the most important predictor, followed by FIRE_MONTH, with FIRE_YEAR contributing relatively little. This is consistent with the EDA findings.
+
+## Practical Interpretation
+This model uses 24 years of wildfire history to estimate, for any U.S. state and any upcoming month, how likely it is that a significant wildfire will occur. The two most important signals match common intuition, where you are and what time of year it is. The random forest improves on the logistic baseline by capturing non-linear interactions between geography and season that logistic regression cannot easily model. All predictions are based strictly on information that would have been available at the time of forecasting, ensuring the evaluation is valid.
